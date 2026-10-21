@@ -3,9 +3,9 @@
 An educational, in-browser explorer for the SQLite file format. Drop in a `.db` file and walk through it: 
 the 100-byte header, every page, every cell, every varint, and the B-tree paths a query takes.
 
-> Status: early planning. The current code is a working SQLite reader from the
-> [Codecrafters "Build your own SQLite"](https://app.codecrafters.io/courses/sqlite/overview) challenge.
-> It will become the core of the visualizer.
+> Status: Phase 1 (core hardening) in progress. The code started as a working SQLite reader from the
+> [Codecrafters "Build your own SQLite"](https://app.codecrafters.io/courses/sqlite/overview) challenge
+> and is being reshaped into the core of the visualizer.
 
 ## Why
 
@@ -44,7 +44,7 @@ One Rust core, two hosts:
 
 | Crate | Role |
 |---|---|
-| `core` | All the Codecrafters code in one library crate, with no I/O and no panics. **File format:** the DB header, page headers, cell pointer arrays, cells, varints, record headers and serial types, overflow chains, and the freelist. Every parsed field carries a `Span { offset, len }` so the UI can highlight its bytes. Reads bytes one page at a time through a synchronous `PageSource` trait and never needs the whole file in memory. **SQL:** the tokenizer, parser, schema loading (`parse_meta`) and executor. Full scans and index scans report each step to a `Tracer` (`VisitPage`, `CompareKey`, `Descend`, `EmitRow`, …), and the UI replays those events. Schema loading needs the SQL parser, so the format and SQL code stay in one crate. |
+| `core` | All the Codecrafters code in one library crate, with no I/O and no panics. **File format:** the DB header, page headers, cell pointer arrays, cells, varints, record headers and serial types, overflow chains, and the freelist. Every parsed field carries a `Span { offset, len }` so the UI can highlight its bytes. Reads bytes one page at a time through a synchronous `PageSource` trait and never needs the whole file in memory. **SQL:** the tokenizer, parser, schema loading (`Schema::new`) and executor. Full scans and index scans report each step to a `Tracer` (`VisitPage`, `CompareKey`, `Descend`, `EmitRow`, …), and the UI replays those events. Schema loading needs the SQL parser, so the format and SQL code stay in one crate. |
 | `wasm` | Thin `wasm-bindgen` layer that exposes `core` functions to JS. Runs inside a **Web Worker**. Its `PageSource` calls `FileReaderSync` on `File.slice()`, so reads stay synchronous and the UI thread never blocks. |
 | `cli` | The Codecrafters-compatible command line (`.dbinfo`, `.tables`, `.page N`, `SELECT …`). Handy for checking `core` without the UI. |
 | `server` | Axum app. It serves the UI as one binary with the assets embedded, provides a library of sample databases, and runs **local mode** (see below). It will later host the **mutation lab**: run `INSERT`/`DELETE` with real SQLite (rusqlite) and get before/after page snapshots that show B-tree splits and merges. |
@@ -92,14 +92,23 @@ sqlite_dungeon/
 ├── Cargo.toml                 # workspace
 ├── justfile
 ├── crates/
-│   ├── core/                  # library: all Codecrafters code
+│   ├── core/                  # library `dungeon_core`: all Codecrafters code
 │   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── pager.rs, btree.rs, exceptions.rs, utils.rs   # today
-│   │       ├── processor.rs                                   # today: executor (full/index scan)
-│   │       ├── parser/{mod,tokenizer,create,select}.rs        # today: SQL parser
-│   │       └── later split btree.rs into: header, page, cell, record, varint,
-│   │           overflow, freelist, span, source, trace
+│   │       ├── lib.rs                     # module list, TEST_DB path
+│   │       ├── page_source.rs             # PageSource trait (read_exact_at + default read_page)
+│   │       ├── file_source.rs             # FileSource: positional reads from disk
+│   │       ├── db/
+│   │       │   ├── db.rs                  # Db<S>, DbHeader, Schema
+│   │       │   ├── page.rs                # Page, PageType, PageBuilder
+│   │       │   ├── page_cell.rs           # PageCell (4 cell kinds), overflow chain
+│   │       │   ├── payload.rs             # record header + columns
+│   │       │   ├── column.rs              # ColumnType (serial types), ColumnValue
+│   │       │   └── utils.rs, tests.rs     # varint, offsets; tests.rs is empty for now
+│   │       ├── parser/{mod,tokenizer,create,select,elements}.rs   # SQL parser; elements: Table, Index
+│   │       ├── processor.rs               # executor: full scan, index scan, row lookup
+│   │       ├── data_types.rs              # ValueExpr (SQLite sort order)
+│   │       ├── exceptions.rs, utils.rs    # CustomErr, builder/getter macros
+│   │       └── later: mem_source, span, freelist, trace
 │   ├── wasm/
 │   │   └── src/lib.rs
 │   ├── server/
@@ -158,15 +167,56 @@ sqlite_dungeon/
 - [x] Keep the existing tests green. They use `companies.db`, so move it to `samples/`.
 
 ### Phase 1 — Core hardening
-- [ ] Add a synchronous `PageSource` trait (`page_size()`, `page_count()`, `read_page(n)`) to replace the `std::fs`-bound `Pager`. Implement `MemSource(Vec<u8>)` for tests and small samples, and `FileSource` (positional reads) for native builds.
+- [ ] **`PageSource` trait** to replace the `std::fs`-bound `Pager` (mostly done):
+  - [x] Add the `PageSource` trait (`page_source.rs`) and `FileSource` (`file_source.rs`, positional reads), and delete `pager.rs`.
+  - [x] Keep the trait to I/O only. Sources implement just `read_exact_at`, and `read_page(page_number, page_size)` is a default method. The `page_size`/`page_count` getters and setters are gone.
+  - [x] Move header parsing out of the trait into `DbHeader::parse(&[u8; 100])` (`db/db.rs`).
+  - [x] Reject page 0 in `read_page` with `CustomErr::ReadPage`, so `(page_number - 1)` can no longer underflow. Covered by `page_source::tests::test_read_page`.
+  - [x] Move the callers (the `cli` and every test module) to the new API. The workspace builds and all 24 `dungeon_core` tests pass.
+  - [ ] Make `FileSource::open(path) -> Result<Self, _>` replace `new()`, which panics on a bad path (`expect("Invalid file path")`).
+  - [ ] Remove the `unwrap()` calls in `DbHeader::parse`. They can't fail on a `[u8; 100]` today, but return `Result` anyway once `Span`s are added.
+  - [ ] Add `MemSource(Vec<u8>)` in `mem_source.rs` for tests and small samples. Tests:
+    - `MemSource`'s own bounds checks go in `mem_source.rs`.
+    - `page_source::tests` switches from its private `VecSource` to `MemSource`.
+    - `Db` tests open `Db::open(MemSource::new(bytes))`, so they don't touch the disk and can use tiny or corrupt hand-built DBs.
+  - [ ] Note: `FileSource` uses `std::os::unix::fs::FileExt`, so it builds on Unix only. Windows needs `std::os::windows::fs::FileExt::seek_read`.
+- [ ] **`Db<S>` owner struct** (partly done). One value owns everything that belongs to an open database file, so the source, header and schema can't drift apart and `pager` stops being passed through every function. Target API:
+  ```rust
+  pub struct Db<S: PageSource> {
+      src: S,            // where the bytes come from
+      header: DbHeader,  // parsed once, on open
+      schema: Schema,    // tables + indexes from page 1
+  }
+  impl<S: PageSource> Db<S> {
+      pub fn open(src: S) -> Result<Self, CustomErr>;  // reads header + page 1
+      pub fn header(&self) -> &DbHeader;
+      pub fn schema(&self) -> &Schema;
+      pub fn page(&mut self, n: u64) -> Result<Page, CustomErr>;
+      pub fn query(&mut self, sql: &str) -> Result<String, CustomErr>;
+  }
+  // cli: let mut db = Db::open(FileSource::open(path)?)?; db.query(sql)?
+  ```
+  - [x] Add `Db<S> { src, header, schema }` in `db/db.rs`, with `Db::open(src)` reading the header and page 1.
+  - [x] Replace `BTree` with `Schema` (built from page 1 by `Schema::new(&page_01)`), and move `Table`/`Index` and their builders to `parser/elements.rs`.
+  - [x] Update the `cli` and the tests to `Db`. `cli` uses `db.header.page_size`, `db.table_count()`, `db.tables()` and `db.parse_page(n)`; queries go through `processor::process(&mut db, sql)`.
+  - [x] Keep `Db` generic over `S` instead of using `Box<dyn PageSource>`: each binary uses exactly one source (CLI/server → `FileSource`, wasm → `JsFileSource`, tests → `MemSource`).
+  - [x] **Borrowing:** `process` copies the root page numbers (`u64`) out of `&Table` before calling the scans with `&mut Db`, so the schema borrow ends first and E0502 doesn't occur. If the scans ever need `&Table` and `&mut` source at the same time, borrow the fields separately: `let Db { src, schema, .. } = db;`.
+  - [ ] Make `schema` a plain `Schema` instead of `Option<Schema>`. `Db::open` always sets it, so the `None` branches in `table_count`, `table` and `tables` are dead code.
+  - [ ] Make the fields private (`src`, `header` and `schema` are `pub` today) and expose `header()` and `schema()` accessors, so a caller can't swap the source under a loaded schema.
+  - [ ] Move to the target public API: `db.page(n)` (today `parse_page`) and `db.query(sql)` wrapping `processor::process`. Then make `parse_page`, `process` and the scans internal.
+  - [ ] Later, together with the page cache: change reads to take `&self` (`File::read_at` only needs `&self`) and put the cache behind a `RefCell`/`Mutex`. That lets Axum handlers share one `Db`. Sharing across threads also needs `Rc` in `Table` to become `Arc`.
+- [ ] **Errors with `thiserror`** (started: the dependency is added, but `thiserror::Error` is imported and not used yet):
+  - [ ] Derive `Error` on `CustomErr` and replace the hand-written `From` impls with `#[from]`.
+  - [ ] Have `IOError` carry the `io::Error` (`Io(#[from] io::Error)`). At the moment `map_err(|_| CustomErr::IOError)` discards the cause.
+  - [ ] Remove `anyhow` from `core`'s `Cargo.toml`. `core` doesn't use it, and a library should expose typed errors; `anyhow` belongs in `cli` and `server`.
 - [ ] Add a small LRU page cache in front of any `PageSource`.
 - [ ] Add `Span` to every parsed field.
 - [ ] Remove `expect`/`unwrap`/slice panics from parsing paths and make `parse_varint` bounds-checked.
-- [ ] Fix known bugs:
-  - [ ] Serial types 6 (`Int64`) and 7 (`Float64`) are 8 bytes long, not 6.
-  - [ ] Serial types 8 and 9 should decode to the integers 0 and 1, not `Null`.
-  - [ ] Read the interior-page right pointer relative to the page header, so it works on page 1 (offset 100 + 8).
-  - [ ] Make the overflow chain advance its pointer, and compute the local payload size using the spec's U/X/M/K formula.
+- [ ] Fix known bugs (all still present after the restructure):
+  - [ ] Serial types 6 (`Int64`) and 7 (`Float64`) are 8 bytes long, not 6 (`ColumnType::new` in `db/column.rs`).
+  - [ ] Serial types 8 and 9 should decode to the integers 0 and 1, not `Null` (`ColumnValue::new` in `db/column.rs`).
+  - [ ] Read the interior-page right pointer relative to the page header, so it works on page 1 (offset 100 + 8). Today it's `get_offset(&buf, 8, 4)` in `Db::parse_page`.
+  - [ ] Make the overflow chain advance its pointer, and compute the local payload size using the spec's U/X/M/K formula (`get_overflow_payload` in `db/page_cell.rs`).
 - [ ] Parse the freelist (trunk and leaf pages) and classify every page for the page map.
 - [ ] Derive serde types for UI output.
 - [ ] Add `cargo-fuzz` targets for page and record parsing.
@@ -174,7 +224,7 @@ sqlite_dungeon/
 ### Phase 2 — Axum local mode + first screen
 - [ ] Create the `server` skeleton:
   - CLI args (`--db`, `--port`, `--bind`)
-  - shared `AppState` holding the open DB behind `Arc<Mutex<…>>`, since the core uses `Rc` and isn't `Sync`
+  - shared `AppState { db: Arc<Mutex<Db<FileSource>>> }`, since the core uses `Rc` and isn't `Sync`. Once `Db` reads take `&self` and the core uses `Arc`, this can become `Arc<Db<FileSource>>`.
   - `tracing` logs and graceful shutdown
 - [ ] Bind to `127.0.0.1` by default, because local mode exposes a file on disk. Serving it on other interfaces needs an explicit flag.
 - [ ] Open the DB read-only with `FileSource`. Add `GET /api/db/header`, `GET /api/db/page/:n`, and `GET /api/db/schema`. Responses are serde types from `core`.
@@ -204,7 +254,7 @@ sqlite_dungeon/
 - [ ] Build `<walk-player>`: replay the events on the B-tree view (F8).
 
 ### Phase 6 — WASM browser mode
-- [ ] Fill in the `wasm` crate, mirroring the HTTP API: `open(file)`, `header()`, `page(n)`, `classify_pages(from, to)`, `walk(sql, max_events)`.
+- [ ] Fill in the `wasm` crate, mirroring the HTTP API: `open(file)`, `header()`, `page(n)`, `classify_pages(from, to)`, `walk(sql, max_events)`. `#[wasm_bindgen]` can't export generic types, so wrap a concrete one: `pub struct WasmDb(Db<JsFileSource>)`.
 - [ ] Add `JsFileSource`: a `PageSource` that calls an imported JS function, `read_at(offset, len)`, which uses `FileReaderSync` on `File.slice()`.
 - [ ] Add `worker.js` to run the WASM in a Web Worker, plus a small request/response protocol over `postMessage` with request ids, progress messages and cancellation.
 - [ ] Implement `WorkerSource`. All existing views should work unchanged, which tests whether the `DataSource` abstraction is sound.

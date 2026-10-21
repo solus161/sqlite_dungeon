@@ -3,6 +3,8 @@ use std::io;
 use std::num::{ParseFloatError, ParseIntError};
 use std::string::FromUtf8Error;
 
+use thiserror::Error;
+
 #[derive(Debug)]
 pub enum CustomErr {
     Tokenize(String),
@@ -14,6 +16,8 @@ pub enum CustomErr {
     BuildAST(String),
     ValidateAST(String),
     Execution(String),
+    IOError,
+    InvalidMetadata
 }
 
 impl From<ParseIntError> for CustomErr {

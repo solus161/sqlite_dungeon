@@ -3,5 +3,5 @@ resolver = "3"
 members = ["crates/cli","crates/core", "crates/server", "crates/wasm"]
 
 [workspace.dependencies]
-anyhow = "1.0.104"
 paste = "1.0.15"
+thiserror = "2.0.21"

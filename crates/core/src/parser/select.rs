@@ -1,7 +1,9 @@
-use super::tokenizer::{Token, Tokens, tokenize};
+use super::tokenizer::{Token, Tokens};
 use super::{Build, Eval, EvalOutput};
-use crate::btree::{CellColValue, CellPayload, Table};
+use crate::db::payload::{Payload};
 use crate::exceptions::CustomErr;
+use crate::data_types::ValueExpr;
+use super::elements::Table;
 
 // Trait for node that can be evaluated into bool
 // WhereCondition or WhereOperator node
@@ -57,7 +59,7 @@ impl Build for SelectStmt {
 }
 
 impl SelectStmt {
-    pub fn eval_where(&self, row: &CellPayload) -> Result<bool, CustomErr> {
+    pub fn eval_where(&self, row: &Payload) -> Result<bool, CustomErr> {
         let Some(where_clause) = &self.where_clause else {
             return Ok(true);
         };
@@ -380,7 +382,7 @@ impl WhereClause {
 }
 
 impl Eval for WhereClause {
-    fn eval(&self, row: &CellPayload) -> Result<EvalOutput, CustomErr> {
+    fn eval(&self, row: &Payload) -> Result<EvalOutput, CustomErr> {
         self.0.eval(row)
     }
 }
@@ -605,7 +607,7 @@ impl Build for WhereExpr {
 }
 
 impl Eval for WhereExpr {
-    fn eval(&self, row: &CellPayload) -> Result<EvalOutput, CustomErr> {
+    fn eval(&self, row: &Payload) -> Result<EvalOutput, CustomErr> {
         let eval_output = match self {
             Self::Condition(cond) => cond.eval(row)?,
             Self::Operator(box_op) => box_op.eval(row)?,
@@ -625,7 +627,7 @@ pub struct WhereOperator {
 impl Eq for WhereOperator {}
 
 impl Eval for WhereOperator {
-    fn eval(&self, row: &CellPayload) -> Result<EvalOutput, CustomErr> {
+    fn eval(&self, row: &Payload) -> Result<EvalOutput, CustomErr> {
         let left_bool = self.left.eval(row)?;
         let right_bool = self.right.eval(row)?;
         let output_bool = match self.op {
@@ -663,7 +665,7 @@ impl WhereCondition {
 }
 
 impl Eval for WhereCondition {
-    fn eval(&self, row: &CellPayload) -> Result<EvalOutput, CustomErr> {
+    fn eval(&self, row: &Payload) -> Result<EvalOutput, CustomErr> {
         let index = self
             .column_expr
             .index()
@@ -738,73 +740,6 @@ impl TryFrom<&Token<'_>> for LogicOp {
 // Parenthese
 struct Lparen;
 
-#[derive(Debug, Clone)]
-pub enum ValueExpr {
-    Text(String),
-    Integer(i64),
-    Float(f64),
-    Null,
-}
-
-impl PartialOrd for ValueExpr {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        // Follow SQLite's storage-class sort order: NULL < numeric < text.
-        // The derived order would place Null last (largest), which breaks index
-        // traversal because SQLite stores NULL keys first in the b-tree.
-        fn rank(v: &ValueExpr) -> u8 {
-            match v {
-                ValueExpr::Null => 0,
-                ValueExpr::Integer(_) | ValueExpr::Float(_) => 1,
-                ValueExpr::Text(_) => 2,
-            }
-        }
-        match (self, other) {
-            (ValueExpr::Text(a), ValueExpr::Text(b)) => a.partial_cmp(b),
-            (ValueExpr::Integer(a), ValueExpr::Integer(b)) => a.partial_cmp(b),
-            (ValueExpr::Float(a), ValueExpr::Float(b)) => a.partial_cmp(b),
-            (ValueExpr::Integer(a), ValueExpr::Float(b)) => (*a as f64).partial_cmp(b),
-            (ValueExpr::Float(a), ValueExpr::Integer(b)) => a.partial_cmp(&(*b as f64)),
-            _ => rank(self).partial_cmp(&rank(other)),
-        }
-    }
-}
-
-impl PartialEq for ValueExpr {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Text(a), Self::Text(b)) => a == b,
-            (Self::Integer(a), Self::Integer(b)) => a == b,
-            (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
-            (Self::Null, _) => false,
-            (_, Self::Null) => false,
-            _ => false,
-        }
-    }
-}
-
-impl TryFrom<&CellColValue> for ValueExpr {
-    type Error = CustomErr;
-
-    fn try_from(value: &CellColValue) -> Result<Self, Self::Error> {
-        let value_expr = match value {
-            CellColValue::Int8(x) => Self::Integer(*x as i64),
-            CellColValue::Int16(x) => Self::Integer(*x as i64),
-            CellColValue::Int24(x) => Self::Integer(*x as i64),
-            CellColValue::Int48(x) => Self::Integer(*x),
-            CellColValue::Int64(x) => Self::Integer(*x),
-            CellColValue::Float64(x) => Self::Float(*x),
-            CellColValue::Text(s) => Self::Text(s.to_string()),
-            CellColValue::Null => Self::Null,
-            _ => {
-                return Err(CustomErr::Execution(
-                    "Cannot be evaluated to scalar".to_string(),
-                ));
-            }
-        };
-        Ok(value_expr)
-    }
-}
-
 pub struct IndexCondition {
     column: String,
     op: CompSpecOp,
@@ -845,7 +780,7 @@ impl IndexCondition {
 }
 
 impl Eval for IndexCondition {
-    fn eval(&self, row: &CellPayload) -> Result<EvalOutput, CustomErr> {
+    fn eval(&self, row: &Payload) -> Result<EvalOutput, CustomErr> {
         // Row is feeded in increasing key order
         let node_col = row.column(0).ok_or(CustomErr::Execution(
             "Index cell has no index value".to_string(),
@@ -877,6 +812,7 @@ impl Eval for IndexCondition {
 // Testing
 #[cfg(test)]
 mod tests {
+    use crate::parser::tokenizer::tokenize;
     use super::*;
 
     #[test]

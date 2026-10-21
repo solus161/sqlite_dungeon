@@ -1,8 +1,12 @@
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 
-use crate::btree::{BTree, Cell, CellPayload, Page, PageType};
+// use crate::btree::{BTree, Cell, CellPayload, Page, PageType};
+use crate::db::db::Db;
+use crate::db::page_cell::PageCell;
+use crate::db::page::{Page, PageType};
+use crate::db::payload::Payload;
 use crate::exceptions::CustomErr;
+use crate::page_source::PageSource;
 use crate::parser::select::{ColumnExpr, CompSpecOp, IndexCondition, SelectStmt};
 use crate::parser::{Ast, Eval, ast_from_str};
 
@@ -16,7 +20,9 @@ impl QueryOutput {
     }
 }
 
-pub fn process(btree: &mut BTree, s: &str) -> Result<String, CustomErr> {
+pub fn process<S>(db: &mut Db<S>, s: &str) -> Result<String, CustomErr>
+where S: PageSource
+{
     // TODO: String is a simple output, thing could be more complicated
     let ast = ast_from_str(s)?.ok_or(CustomErr::Execution("Blank AST".to_string()))?;
 
@@ -33,8 +39,8 @@ pub fn process(btree: &mut BTree, s: &str) -> Result<String, CustomErr> {
                 .table_name()
                 .ok_or(CustomErr::ValidateAST("Table name not found".to_string()))?;
 
-            let table = btree
-                .get_table(table_name)
+            let table = db 
+                .table(table_name)
                 .ok_or(CustomErr::Execution("Table not found".to_string()))?;
 
             // Match column name in where with index in payload
@@ -52,7 +58,7 @@ pub fn process(btree: &mut BTree, s: &str) -> Result<String, CustomErr> {
             // We just need one index to walk one tree
             let payloads = if !have_index {
                 let start_ptr = table.page_ptr();
-                full_scan(btree, &stmt, start_ptr)?
+                full_scan(db, &stmt, start_ptr)?
             } else {
                 let index_filter = index_cond.expect("Index could be inplace");
                 let index = table
@@ -60,11 +66,11 @@ pub fn process(btree: &mut BTree, s: &str) -> Result<String, CustomErr> {
                     .expect("Index should be there");
                 let idx_start_ptr = index.page_ptr();
                 let tbl_start_ptr = table.page_ptr();
-                index_scan(btree, &index_filter, &stmt, idx_start_ptr, tbl_start_ptr)?
+                index_scan(db, &index_filter, &stmt, idx_start_ptr, tbl_start_ptr)?
             };
 
             // Got the rows, how choose what to return
-            let mut output = extract_columns(btree, payloads, &stmt);
+            let mut output = extract_columns(db, payloads, &stmt);
             output.sort();
             Ok(output.join("\n"))
         }
@@ -72,11 +78,13 @@ pub fn process(btree: &mut BTree, s: &str) -> Result<String, CustomErr> {
     }
 }
 
-fn full_scan(
-    btree: &mut BTree,
+fn full_scan<S>(
+    db: &mut Db<S>,
     filter: &SelectStmt,
     start_ptr: u64,
-) -> Result<Vec<CellPayload>, CustomErr> {
+) -> Result<Vec<Payload>, CustomErr>
+where S: PageSource
+{
     let mut page_queue: VecDeque<u64> = VecDeque::new();
     page_queue.push_back(start_ptr);
     let mut payloads = Vec::new();
@@ -86,7 +94,7 @@ fn full_scan(
         let Some(page_ptr) = page_queue.pop_front() else {
             break;
         };
-        let page = btree.parse_page(&page_ptr)?;
+        let page = db.parse_page(page_ptr)?;
 
         // Ptr to the right-most subtree, which no cell points at.
         // Only once: pushing it twice walks that subtree twice and duplicates its rows.
@@ -98,10 +106,10 @@ fn full_scan(
         let cells = page.cells();
         for cell in cells.values() {
             match cell {
-                Cell::TblInterior { left_child_ptr, .. } => {
+                PageCell::TblInterior { left_child_ptr, .. } => {
                     page_queue.push_back(*left_child_ptr);
                 }
-                Cell::TblLeaf { payload, .. } => {
+                PageCell::TblLeaf { payload, .. } => {
                     if filter.eval_where(payload)? {
                         payloads.push(payload.clone());
                     };
@@ -118,13 +126,15 @@ fn full_scan(
     Ok(payloads)
 }
 
-fn index_scan(
-    btree: &mut BTree,
+fn index_scan<S>(
+    db: &mut Db<S>,
     idx_filter: &IndexCondition,
     tbl_filter: &SelectStmt,
     idx_start_ptr: u64,
     tbl_start_ptr: u64,
-) -> Result<Vec<CellPayload>, CustomErr> {
+) -> Result<Vec<Payload>, CustomErr> 
+where S: PageSource
+{
     let mut idx_queue: VecDeque<u64> = VecDeque::new(); // left and righ ptr
     let mut row_id_queue: Vec<u64> = Vec::new();
 
@@ -135,7 +145,7 @@ fn index_scan(
         let Some(page_ptr) = idx_queue.pop_front() else {
             break;
         };
-        let page = btree.parse_page(&page_ptr)?;
+        let page = db.parse_page(page_ptr)?;
         let page_type = page.page_type();
         let right_ptr = page.right_ptr();
 
@@ -275,21 +285,23 @@ fn index_scan(
     // Extract table rows
     // First filter the row id list
     row_id_queue.sort();
-    let payloads = extract_rows(btree, &row_id_queue, tbl_filter, tbl_start_ptr)?;
+    let payloads = extract_rows(db, &row_id_queue, tbl_filter, tbl_start_ptr)?;
 
     Ok(payloads)
 }
 
-pub fn extract_rows(
-    btree: &mut BTree,
+pub fn extract_rows<S>(
+    db: &mut Db<S>,
     row_ids: &[u64],
     tbl_filter: &SelectStmt,
     tbl_start_ptr: u64,
-) -> Result<Vec<CellPayload>, CustomErr> {
+) -> Result<Vec<Payload>, CustomErr>
+where S: PageSource
+{
     let mut page_cache: HashMap<u64, Page> = HashMap::new();
     let mut page_queue: VecDeque<u64> = VecDeque::new();
 
-    let mut output: Vec<CellPayload> = Vec::new();
+    let mut output: Vec<Payload> = Vec::new();
     for row_id in row_ids {
         page_queue.push_back(tbl_start_ptr);
 
@@ -299,7 +311,7 @@ pub fn extract_rows(
                 .expect("Page queue must not be empty");
             let page =
                 if let std::collections::hash_map::Entry::Vacant(e) = page_cache.entry(page_ptr) {
-                    let page = btree.parse_page(&page_ptr)?;
+                    let page = db.parse_page(page_ptr)?;
                     e.insert(page);
                     page_cache.get(&page_ptr).expect("Page must be there")
                 } else {
@@ -342,11 +354,13 @@ pub fn extract_rows(
     Ok(output)
 }
 
-fn extract_columns(
-    btree: &BTree,
-    mut payloads: Vec<CellPayload>,
+fn extract_columns<S>(
+    db: &Db<S>,
+    mut payloads: Vec<Payload>,
     stmt: &SelectStmt,
-) -> Vec<String> {
+) -> Vec<String>
+where S: PageSource
+{
     // Only support column at the moment, no Count or Group By
     let mut columns_index: Vec<i64> = Vec::new();
 
@@ -354,7 +368,7 @@ fn extract_columns(
         .from_clause
         .table_name()
         .expect("Only support literal column");
-    let table = btree.get_table(table_name).expect("Table not exists");
+    let table = db.table(table_name).expect("Table not exists");
 
     let select_clause = stmt.select_clause.columns();
     let mut output = Vec::new();
@@ -415,17 +429,16 @@ fn extract_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{pager::Pager, TEST_DB};
+    use crate::{TEST_DB, db::db::Db, file_source::FileSource};
 
     #[test]
     fn test_fullscan_and() {
         let s = "select * from companies \
                 where locality = 'burnsville, minnesota, united states' and \
                 year_founded = '1998.0'";
-        let pager = Pager::new(TEST_DB);
-        let mut btree = BTree::new(pager);
-        let _ = btree.parse_meta();
-        let output = process(&mut btree, s);
+        let src = FileSource::new(TEST_DB);
+        let mut db = Db::open(src).expect("Cannot open db");
+        let output = process(&mut db, s);
         println!("Fullscan payloads: {:?}", output);
         assert!(output.is_ok());
     }
@@ -435,10 +448,9 @@ mod tests {
         let s = "select * from companies \
                 where locality = 'burnsville, minnesota, united states' or \
                 year_founded = '1998.0'";
-        let pager = Pager::new(TEST_DB);
-        let mut btree = BTree::new(pager);
-        let _ = btree.parse_meta();
-        let output = process(&mut btree, s);
+        let src = FileSource::new(TEST_DB);
+        let mut db = Db::open(src).expect("Cannot open db");
+        let output = process(&mut db, s);
         println!("Full scan payloads: {:?}", output);
         assert!(output.is_ok());
     }
@@ -448,10 +460,9 @@ mod tests {
         // let s = "select * from companies where country = 'american samoa';";
         let s = "select * from companies where country = 'oman';";
         // let s = "select * from companies where country = 'anantigua and barbuda';";
-        let pager = Pager::new(TEST_DB);
-        let mut btree = BTree::new(pager);
-        let _ = btree.parse_meta();
-        let output = process(&mut btree, s);
+        let src = FileSource::new(TEST_DB);
+        let mut db = Db::open(src).expect("Cannot open db");
+        let output = process(&mut db, s);
         println!("Index scan payloads: {:?}", output);
         assert!(output.is_ok());
     }
@@ -461,10 +472,9 @@ mod tests {
         // let s = "select * from companies where country = 'american samoa';";
         let s = "select * from companies where country > 'yemen';";
         // let s = "select * from companies where country = 'anantigua and barbuda';";
-        let pager = Pager::new(TEST_DB);
-        let mut btree = BTree::new(pager);
-        let _ = btree.parse_meta();
-        let output = process(&mut btree, s);
+        let src = FileSource::new(TEST_DB);
+        let mut db = Db::open(src).expect("Cannot open db");
+        let output = process(&mut db, s);
         println!("Index scan GT payloads: {:?}", output);
         assert!(output.is_ok());
     }
@@ -474,11 +484,10 @@ mod tests {
     // `country` carries idx_companies_country, so the range ops go through
     // index_scan while != falls back to full_scan.
     fn count_where(cond: &str) -> u64 {
-        let pager = Pager::new(TEST_DB);
-        let mut btree = BTree::new(pager);
-        let _ = btree.parse_meta();
+        let src = FileSource::new(TEST_DB);
+        let mut db = Db::open(src).expect("Cannot open db");
         let s = format!("select count(*) from companies where {}", cond);
-        let output = process(&mut btree, &s).expect("Query must succeed");
+        let output = process(&mut db, &s).expect("Query must succeed");
         output.trim().parse().expect("Count must be a number")
     }
 

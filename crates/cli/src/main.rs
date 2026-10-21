@@ -1,20 +1,18 @@
 // #![allow(dead_code, unused_imports, unused_variables)]
-use anyhow::{Result, bail};
-use dungeon_core::{btree::BTree, pager::Pager, processor::process};
+use dungeon_core::{db::db::Db, file_source::FileSource, processor::process};
 
-fn main() -> Result<()> {
+fn main() -> Result<(), String> {
     // Parse arguments
     let args = std::env::args().collect::<Vec<_>>();
     match args.len() {
-        0 | 1 => bail!("Missing <database path> and <command>"),
-        2 => bail!("Missing <command>"),
+        0 | 1 => panic!("Missing <database path> and <command>"),
+        2 => panic!("Missing <command>"),
         _ => {}
     }
 
     // Init pager and btree
-    let pager = Pager::new(&args[1]);
-    let mut btree = BTree::new(pager);
-    let _ = btree.parse_meta();
+    let src = FileSource::new(&args[1]);
+    let mut db = Db::open(src).expect("Error open db file");
 
     // Parse command and act accordingly
     let command = &args[2];
@@ -24,12 +22,12 @@ fn main() -> Result<()> {
             eprintln!("Logs from your program will appear here!");
 
             // TODO: Uncomment the code below to pass the first stage
-            println!("database page size: {}", btree.pager.page_size());
-            println!("number of tables: {}", btree.tables.len());
+            println!("database page size: {}", db.header.page_size);
+            println!("number of tables: {}", db.table_count());
         }
         ".tables" => {
             let mut table_names: Vec<&str> = Vec::new();
-            for t in btree.tables.values() {
+            for t in db.tables() {
                 table_names.push(t.name());
             }
             table_names.sort();
@@ -39,11 +37,11 @@ fn main() -> Result<()> {
         // Support extra args for db exploration
         ".page" => {
             let page_no = &args[3].parse::<u64>().expect("Page no must be int");
-            let page = btree.parse_page(page_no).expect("Failed parsing page");
+            let page = db.parse_page(*page_no).expect("Failed parsing page");
             println!("{}", page);
         }
         _ => {
-            let output = process(&mut btree, command.as_str());
+            let output = process(&mut db, command.as_str());
             match output {
                 Ok(v) => println!("{}", v),
                 Err(e) => println!("ERR {:?}", e),

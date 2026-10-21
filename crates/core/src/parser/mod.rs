@@ -1,11 +1,13 @@
 pub mod create;
 pub mod select;
 pub mod tokenizer;
+pub mod elements;
 
-use crate::{btree::CellPayload, exceptions::CustomErr, parser::tokenizer::tokenize};
+use crate::{exceptions::CustomErr, parser::tokenizer::tokenize};
 use create::{CreateIndexStmt, CreateTableStmt};
 use select::SelectStmt;
 use tokenizer::{Token, Tokens};
+use crate::db::payload::Payload;
 
 // A general trait for all AST node
 pub trait Build: Sized {
@@ -16,7 +18,7 @@ pub trait Build: Sized {
 
 // A general trait for all expr that could be evaluated
 pub trait Eval {
-    fn eval(&self, row: &CellPayload) -> Result<EvalOutput, CustomErr>;
+    fn eval(&self, row: &Payload) -> Result<EvalOutput, CustomErr>;
 }
 
 // Output of eval
