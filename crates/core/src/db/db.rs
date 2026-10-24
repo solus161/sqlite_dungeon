@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 
 use crate::db::page::Page;
-use crate::{exceptions::CustomErr, page_source::PageSource};
-use crate::db::page::{PageType, PageBuilder};
+use crate::db::page::{PageBuilder, PageType};
 use crate::db::page_cell::PageCell;
-use crate::parser::elements::{Table, TableBuilder, IndexBuilder};
+use crate::parser::elements::{IndexBuilder, Table, TableBuilder};
 use crate::parser::{Ast, ast_from_str};
+use crate::{exceptions::CustomErr, io::page_source::PageSource};
+use super::utils::get_offset;
 
 pub struct DbHeader {
     pub page_count: u64,
@@ -15,11 +16,7 @@ pub struct DbHeader {
 
 impl DbHeader {
     pub fn parse(buf: &[u8; 100]) -> Result<Self, CustomErr> {
-        let raw_page_size = u16::from_be_bytes(
-            buf[16..16 + 2]
-            .try_into()
-            .unwrap()
-            ) as u64;
+        let raw_page_size = u16::from_be_bytes(buf[16..16 + 2].try_into().unwrap()) as u64;
         let page_size = if raw_page_size == 1 {
             65536
         } else {
@@ -27,12 +24,13 @@ impl DbHeader {
         };
 
         // Page count
-        let page_count: u64 = u32::from_be_bytes(
-            buf[16 + 12..16 + 12 + 4]
-            .try_into().unwrap()
-            ).into();
+        let page_count: u64 =
+            u32::from_be_bytes(buf[16 + 12..16 + 12 + 4].try_into().unwrap()).into();
 
-        Ok(DbHeader { page_count, page_size })
+        Ok(DbHeader {
+            page_count,
+            page_size,
+        })
     }
 }
 
@@ -45,8 +43,8 @@ impl Debug for DbHeader {
     }
 }
 
-pub struct Schema{
-    pub tables: HashMap<String, Table>
+pub struct Schema {
+    pub tables: HashMap<String, Table>,
 }
 
 impl Schema {
@@ -152,54 +150,46 @@ impl Schema {
 /// Wrapper for source, header, and schema
 /// Schema could be None
 pub struct Db<S: PageSource> {
-    pub src: S,
-    pub header: DbHeader,
-    pub schema: Option<Schema>,
+    src: S,
+    header: DbHeader,
+    schema: Schema,
 }
 
 impl<S: PageSource> Db<S> {
     pub fn open(mut src: S) -> Result<Self, CustomErr> {
+        // Parse 100-byte header
         let mut buf = [0u8; 100];
         src.read_exact_at(&mut buf, 0)?;
         let header = DbHeader::parse(&buf)?;
-        let mut db = Self { src, header, schema: None };
-        let page_01 = db.parse_page(1)?;
+
+        let buf = src.read_page(1, header.page_size)?;
+        let page_01 = Self::parse_page(&mut src, &buf, 1, header.page_size)?;
         let schema = Schema::new(&page_01)?;
-        db.schema = Some(schema);
-        Ok(db)
-        // Ok(Self { src, header, schema: () })
+        Ok(Self { src, header, schema })
+    }
+
+    pub fn page_size(&self) -> u64 {
+        self.header.page_size
     }
 
     pub fn table_count(&self) -> usize {
-        if let Some(schema) = &self.schema {
-            schema.tables.len()
-        } else {
-            0
-        }
+        self.schema.tables.len()
     }
 
     pub fn table(&self, name: &str) -> Option<&Table> {
-        if let Some(schema) = &self.schema {
-            schema.table(name)
-        } else {
-            None
-        }
+        self.schema.table(name)
     }
 
     /// Return Vec into &Table, immutable borrowing
     /// Insert/remove from schema must happen after this Vec is dropped
     pub fn tables(&self) -> Vec<&Table> {
-        if let Some(schema) = &self.schema {
-            schema.tables.values().into_iter().collect()
-        } else {
-            Vec::new()
-        }
+        self.schema.tables.values().collect()
     }
 
-    pub fn parse_page(&mut self, page_no: u64) -> Result<Page, CustomErr>
+    /// Core of `page`, independent of `Db` initialization
+    pub fn parse_page(src: &mut S, buf: &[u8], page_no: u64, page_size: u64) -> Result<Page, CustomErr> 
     where S: PageSource
     {
-        let buf = self.src.read_page(page_no, self.header.page_size)?;
         let mut builder = PageBuilder::new(page_no);
 
         // First page, skip first 100 bytes
@@ -207,30 +197,30 @@ impl<S: PageSource> Db<S> {
 
         // Parse the first page
 
-        let page_type = PageType::try_from(get_offset(&buf, offset, 1)[0])?;
+        let page_type = PageType::try_from(get_offset(buf, offset, 1)[0])?;
         offset += 1;
 
         // Start of freeblock
-        let freeblock_offset = u16::from_be_bytes(get_offset(&buf, offset, 2).try_into()?) as u64;
+        let freeblock_offset = u16::from_be_bytes(get_offset(buf, offset, 2).try_into()?) as u64;
         offset += 2;
 
         // Number of cell on page
-        let cell_count = u16::from_be_bytes(get_offset(&buf, offset, 2).try_into()?) as u64;
+        let cell_count = u16::from_be_bytes(get_offset(buf, offset, 2).try_into()?) as u64;
         offset += 2;
 
         // Start of cell content area
-        let cell_area_offset = u16::from_be_bytes(get_offset(&buf, offset, 2).try_into()?) as u64;
+        let cell_area_offset = u16::from_be_bytes(get_offset(buf, offset, 2).try_into()?) as u64;
         offset += 2;
 
         // Number of fragmented free bytes
         let fragmented_freebyte_count =
-            u8::from_be_bytes(get_offset(&buf, offset, 1).try_into()?) as u64;
+            u8::from_be_bytes(get_offset(buf, offset, 1).try_into()?) as u64;
         offset += 1;
 
         // Righ pointer, if any
         match &page_type {
             PageType::TblInterior | PageType::IdxInterior => {
-                let right_ptr = u32::from_be_bytes(get_offset(&buf, 8, 4).try_into()?) as u64;
+                let right_ptr = u32::from_be_bytes(get_offset(buf, 8, 4).try_into()?) as u64;
                 offset += 4;
                 builder.with_right_ptr(right_ptr);
             }
@@ -240,13 +230,13 @@ impl<S: PageSource> Db<S> {
         // Cells offset, in increasing key order
         // physical position of cell does not matter
         for _ in 0..cell_count {
-            let cell_offset = u16::from_be_bytes(get_offset(&buf, offset, 2).try_into()?) as u64;
+            let cell_offset = u16::from_be_bytes(get_offset(buf, offset, 2).try_into()?) as u64;
             let cell = PageCell::new(
-                &page_type, 
+                &page_type,
                 &buf[cell_offset as usize..],
-                &mut self.src,
-                self.header.page_size
-                )?;
+                src,
+                page_size,
+            )?;
             offset += 2;
             builder.with_cell(cell_offset, cell);
         }
@@ -261,28 +251,34 @@ impl<S: PageSource> Db<S> {
         let page = builder.build()?;
         Ok(page)
     }
-}
 
-fn get_offset(buf: &[u8], offset: usize, length: usize) -> &[u8] {
-    &buf[offset..offset + length]
+    /// Wrapper for `parse_page`
+    pub fn page(&mut self, page_no: u64) -> Result<Page, CustomErr>
+    where
+        S: PageSource,
+    {
+        let buf = self.src.read_page(page_no, self.header.page_size)?;
+        Self::parse_page(&mut self.src, &buf, page_no, self.header.page_size)
+        
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_source::FileSource;
     use crate::TEST_DB;
+    use crate::io::file_source::FileSource;
 
     #[test]
     fn test_parse_page_01() {
-        let src = FileSource::new(TEST_DB);
+        let src = FileSource::new(TEST_DB).unwrap();
         let mut db = Db::open(src).unwrap();
-        let page_01 = db.parse_page(1);
+        let page_01 = db.page(1);
         println!("Page 01: {:?}", page_01);
         assert!(page_01.is_ok());
 
         // Page 2, table companies
-        let page_02 = db.parse_page(2);
+        let page_02 = db.page(2);
         println!("Page 02: {:?}", page_02);
         assert!(page_02.is_ok());
 
@@ -290,7 +286,7 @@ mod tests {
         println!("Parse meta result {:?}", db.header);
 
         // Index on country
-        let page_04 = db.parse_page(4);
+        let page_04 = db.page(4);
         println!("Page 04: {:?}", page_04);
     }
 }

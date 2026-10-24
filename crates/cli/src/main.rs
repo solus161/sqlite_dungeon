@@ -1,7 +1,8 @@
 // #![allow(dead_code, unused_imports, unused_variables)]
-use dungeon_core::{db::db::Db, file_source::FileSource, processor::process};
+use dungeon_core::exceptions::CustomErr;
+use dungeon_core::{db::db::Db, io::file_source::FileSource, processor::process};
 
-fn main() -> Result<(), String> {
+fn main() -> Result<(), CustomErr> {
     // Parse arguments
     let args = std::env::args().collect::<Vec<_>>();
     match args.len() {
@@ -11,7 +12,7 @@ fn main() -> Result<(), String> {
     }
 
     // Init pager and btree
-    let src = FileSource::new(&args[1]);
+    let src = FileSource::new(&args[1])?;
     let mut db = Db::open(src).expect("Error open db file");
 
     // Parse command and act accordingly
@@ -22,7 +23,7 @@ fn main() -> Result<(), String> {
             eprintln!("Logs from your program will appear here!");
 
             // TODO: Uncomment the code below to pass the first stage
-            println!("database page size: {}", db.header.page_size);
+            println!("database page size: {}", db.page_size());
             println!("number of tables: {}", db.table_count());
         }
         ".tables" => {
@@ -37,7 +38,7 @@ fn main() -> Result<(), String> {
         // Support extra args for db exploration
         ".page" => {
             let page_no = &args[3].parse::<u64>().expect("Page no must be int");
-            let page = db.parse_page(*page_no).expect("Failed parsing page");
+            let page = db.page(*page_no).expect("Failed parsing page");
             println!("{}", page);
         }
         _ => {

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::fmt::Display;
 
-use crate::exceptions::CustomErr;
 use super::page_cell::PageCell;
+use crate::exceptions::CustomErr;
 
 #[derive(Debug, PartialEq)]
 pub enum PageType {

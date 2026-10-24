@@ -17,7 +17,7 @@ pub enum CustomErr {
     ValidateAST(String),
     Execution(String),
     IOError,
-    InvalidMetadata
+    InvalidMetadata,
 }
 
 impl From<ParseIntError> for CustomErr {

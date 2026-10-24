@@ -2,11 +2,11 @@ use std::collections::{HashMap, VecDeque};
 
 // use crate::btree::{BTree, Cell, CellPayload, Page, PageType};
 use crate::db::db::Db;
-use crate::db::page_cell::PageCell;
 use crate::db::page::{Page, PageType};
+use crate::db::page_cell::PageCell;
 use crate::db::payload::Payload;
 use crate::exceptions::CustomErr;
-use crate::page_source::PageSource;
+use crate::io::page_source::PageSource;
 use crate::parser::select::{ColumnExpr, CompSpecOp, IndexCondition, SelectStmt};
 use crate::parser::{Ast, Eval, ast_from_str};
 
@@ -21,7 +21,8 @@ impl QueryOutput {
 }
 
 pub fn process<S>(db: &mut Db<S>, s: &str) -> Result<String, CustomErr>
-where S: PageSource
+where
+    S: PageSource,
 {
     // TODO: String is a simple output, thing could be more complicated
     let ast = ast_from_str(s)?.ok_or(CustomErr::Execution("Blank AST".to_string()))?;
@@ -39,7 +40,7 @@ where S: PageSource
                 .table_name()
                 .ok_or(CustomErr::ValidateAST("Table name not found".to_string()))?;
 
-            let table = db 
+            let table = db
                 .table(table_name)
                 .ok_or(CustomErr::Execution("Table not found".to_string()))?;
 
@@ -83,7 +84,8 @@ fn full_scan<S>(
     filter: &SelectStmt,
     start_ptr: u64,
 ) -> Result<Vec<Payload>, CustomErr>
-where S: PageSource
+where
+    S: PageSource,
 {
     let mut page_queue: VecDeque<u64> = VecDeque::new();
     page_queue.push_back(start_ptr);
@@ -94,7 +96,7 @@ where S: PageSource
         let Some(page_ptr) = page_queue.pop_front() else {
             break;
         };
-        let page = db.parse_page(page_ptr)?;
+        let page = db.page(page_ptr)?;
 
         // Ptr to the right-most subtree, which no cell points at.
         // Only once: pushing it twice walks that subtree twice and duplicates its rows.
@@ -132,8 +134,9 @@ fn index_scan<S>(
     tbl_filter: &SelectStmt,
     idx_start_ptr: u64,
     tbl_start_ptr: u64,
-) -> Result<Vec<Payload>, CustomErr> 
-where S: PageSource
+) -> Result<Vec<Payload>, CustomErr>
+where
+    S: PageSource,
 {
     let mut idx_queue: VecDeque<u64> = VecDeque::new(); // left and righ ptr
     let mut row_id_queue: Vec<u64> = Vec::new();
@@ -145,7 +148,7 @@ where S: PageSource
         let Some(page_ptr) = idx_queue.pop_front() else {
             break;
         };
-        let page = db.parse_page(page_ptr)?;
+        let page = db.page(page_ptr)?;
         let page_type = page.page_type();
         let right_ptr = page.right_ptr();
 
@@ -296,7 +299,8 @@ pub fn extract_rows<S>(
     tbl_filter: &SelectStmt,
     tbl_start_ptr: u64,
 ) -> Result<Vec<Payload>, CustomErr>
-where S: PageSource
+where
+    S: PageSource,
 {
     let mut page_cache: HashMap<u64, Page> = HashMap::new();
     let mut page_queue: VecDeque<u64> = VecDeque::new();
@@ -311,7 +315,7 @@ where S: PageSource
                 .expect("Page queue must not be empty");
             let page =
                 if let std::collections::hash_map::Entry::Vacant(e) = page_cache.entry(page_ptr) {
-                    let page = db.parse_page(page_ptr)?;
+                    let page = db.page(page_ptr)?;
                     e.insert(page);
                     page_cache.get(&page_ptr).expect("Page must be there")
                 } else {
@@ -354,12 +358,9 @@ where S: PageSource
     Ok(output)
 }
 
-fn extract_columns<S>(
-    db: &Db<S>,
-    mut payloads: Vec<Payload>,
-    stmt: &SelectStmt,
-) -> Vec<String>
-where S: PageSource
+fn extract_columns<S>(db: &Db<S>, mut payloads: Vec<Payload>, stmt: &SelectStmt) -> Vec<String>
+where
+    S: PageSource,
 {
     // Only support column at the moment, no Count or Group By
     let mut columns_index: Vec<i64> = Vec::new();
@@ -429,14 +430,14 @@ where S: PageSource
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{TEST_DB, db::db::Db, file_source::FileSource};
+    use crate::{TEST_DB, db::db::Db, io::file_source::FileSource};
 
     #[test]
     fn test_fullscan_and() {
         let s = "select * from companies \
                 where locality = 'burnsville, minnesota, united states' and \
                 year_founded = '1998.0'";
-        let src = FileSource::new(TEST_DB);
+        let src = FileSource::new(TEST_DB).unwrap();
         let mut db = Db::open(src).expect("Cannot open db");
         let output = process(&mut db, s);
         println!("Fullscan payloads: {:?}", output);
@@ -448,7 +449,7 @@ mod tests {
         let s = "select * from companies \
                 where locality = 'burnsville, minnesota, united states' or \
                 year_founded = '1998.0'";
-        let src = FileSource::new(TEST_DB);
+        let src = FileSource::new(TEST_DB).unwrap();
         let mut db = Db::open(src).expect("Cannot open db");
         let output = process(&mut db, s);
         println!("Full scan payloads: {:?}", output);
@@ -460,7 +461,7 @@ mod tests {
         // let s = "select * from companies where country = 'american samoa';";
         let s = "select * from companies where country = 'oman';";
         // let s = "select * from companies where country = 'anantigua and barbuda';";
-        let src = FileSource::new(TEST_DB);
+        let src = FileSource::new(TEST_DB).unwrap();
         let mut db = Db::open(src).expect("Cannot open db");
         let output = process(&mut db, s);
         println!("Index scan payloads: {:?}", output);
@@ -472,7 +473,7 @@ mod tests {
         // let s = "select * from companies where country = 'american samoa';";
         let s = "select * from companies where country > 'yemen';";
         // let s = "select * from companies where country = 'anantigua and barbuda';";
-        let src = FileSource::new(TEST_DB);
+        let src = FileSource::new(TEST_DB).unwrap();
         let mut db = Db::open(src).expect("Cannot open db");
         let output = process(&mut db, s);
         println!("Index scan GT payloads: {:?}", output);
@@ -484,7 +485,7 @@ mod tests {
     // `country` carries idx_companies_country, so the range ops go through
     // index_scan while != falls back to full_scan.
     fn count_where(cond: &str) -> u64 {
-        let src = FileSource::new(TEST_DB);
+        let src = FileSource::new(TEST_DB).unwrap();
         let mut db = Db::open(src).expect("Cannot open db");
         let s = format!("select count(*) from companies where {}", cond);
         let output = process(&mut db, &s).expect("Query must succeed");

@@ -30,7 +30,10 @@ mod tests {
     impl PageSource for VecSource {
         fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), CustomErr> {
             let start = offset as usize;
-            let src = self.0.get(start..start + buf.len()).ok_or(CustomErr::IOError)?;
+            let src = self
+                .0
+                .get(start..start + buf.len())
+                .ok_or(CustomErr::IOError)?;
             buf.copy_from_slice(src);
             Ok(())
         }

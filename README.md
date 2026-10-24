@@ -79,6 +79,7 @@ Neither mode uploads the file. Uploading a large DB to a remote server is the sl
 | Data to JS | `serde` + `serde-wasm-bindgen` | |
 | Errors | `thiserror` | Replaces the hand-written `CustomErr` conversions |
 | Server | `axum`, `tokio`, `tower-http` (ServeDir, compression), `tracing` | |
+| Diagnostics | `tracing`, `tracing-error` (`SpanTrace`), `tracing-subscriber`, `std::backtrace` | Behind the opt-in `trace` feature in `core`; subscribers live in `cli`/`server`/`wasm` only |
 | Asset embedding | `rust-embed` | Single-binary deployment |
 | Real SQLite (lab only) | `rusqlite` (bundled) | Server side only, never in the WASM build |
 | Frontend | HTML, CSS (custom properties, light/dark), JS modules, Custom Elements, SVG | No dependencies to start with |
@@ -95,20 +96,22 @@ sqlite_dungeon/
 │   ├── core/                  # library `dungeon_core`: all Codecrafters code
 │   │   └── src/
 │   │       ├── lib.rs                     # module list, TEST_DB path
-│   │       ├── page_source.rs             # PageSource trait (read_exact_at + default read_page)
-│   │       ├── file_source.rs             # FileSource: positional reads from disk
+│   │       ├── io/
+│   │       │   ├── page_source.rs         # PageSource trait (read_exact_at + default read_page)
+│   │       │   ├── file_source.rs         # FileSource: positional reads from disk
+│   │       │   └── mem_source.rs          # MemSource(Vec<u8>): tests, small samples
 │   │       ├── db/
 │   │       │   ├── db.rs                  # Db<S>, DbHeader, Schema
 │   │       │   ├── page.rs                # Page, PageType, PageBuilder
 │   │       │   ├── page_cell.rs           # PageCell (4 cell kinds), overflow chain
 │   │       │   ├── payload.rs             # record header + columns
 │   │       │   ├── column.rs              # ColumnType (serial types), ColumnValue
-│   │       │   └── utils.rs, tests.rs     # varint, offsets; tests.rs is empty for now
+│   │       │   └── utils.rs               # varint, offsets
 │   │       ├── parser/{mod,tokenizer,create,select,elements}.rs   # SQL parser; elements: Table, Index
-│   │       ├── processor.rs               # executor: full scan, index scan, row lookup
+│   │       ├── processor.rs               # executor: full scan, index scan, row lookup; later QueryResult/Row
 │   │       ├── data_types.rs              # ValueExpr (SQLite sort order)
 │   │       ├── exceptions.rs, utils.rs    # CustomErr, builder/getter macros
-│   │       └── later: mem_source, span, freelist, trace
+│   │       └── later: span, freelist, walk recorder (Phase 5)
 │   ├── wasm/
 │   │   └── src/lib.rs
 │   ├── server/
@@ -168,15 +171,15 @@ sqlite_dungeon/
 
 ### Phase 1 — Core hardening
 - [ ] **`PageSource` trait** to replace the `std::fs`-bound `Pager` (mostly done):
-  - [x] Add the `PageSource` trait (`page_source.rs`) and `FileSource` (`file_source.rs`, positional reads), and delete `pager.rs`.
+  - [x] Add the `PageSource` trait (`io/page_source.rs`) and `FileSource` (`io/file_source.rs`, positional reads), and delete `pager.rs`.
   - [x] Keep the trait to I/O only. Sources implement just `read_exact_at`, and `read_page(page_number, page_size)` is a default method. The `page_size`/`page_count` getters and setters are gone.
   - [x] Move header parsing out of the trait into `DbHeader::parse(&[u8; 100])` (`db/db.rs`).
   - [x] Reject page 0 in `read_page` with `CustomErr::ReadPage`, so `(page_number - 1)` can no longer underflow. Covered by `page_source::tests::test_read_page`.
   - [x] Move the callers (the `cli` and every test module) to the new API. The workspace builds and all 24 `dungeon_core` tests pass.
-  - [ ] Make `FileSource::open(path) -> Result<Self, _>` replace `new()`, which panics on a bad path (`expect("Invalid file path")`).
-  - [ ] Remove the `unwrap()` calls in `DbHeader::parse`. They can't fail on a `[u8; 100]` today, but return `Result` anyway once `Span`s are added.
-  - [ ] Add `MemSource(Vec<u8>)` in `mem_source.rs` for tests and small samples. Tests:
-    - `MemSource`'s own bounds checks go in `mem_source.rs`.
+  - [x] Make `FileSource::open(path) -> Result<Self, _>` replace `new()`, which panics on a bad path (`expect("Invalid file path")`).
+  - [x] Remove the `unwrap()` calls in `DbHeader::parse`. They can't fail on a `[u8; 100]` today, but return `Result` anyway once `Span`s are added.
+  - [x] Add `MemSource(Vec<u8>)` in `io/mem_source.rs` for tests and small samples. Tests:
+    - `MemSource`'s own bounds checks go in `io/mem_source.rs`.
     - `page_source::tests` switches from its private `VecSource` to `MemSource`.
     - `Db` tests open `Db::open(MemSource::new(bytes))`, so they don't touch the disk and can use tiny or corrupt hand-built DBs.
   - [ ] Note: `FileSource` uses `std::os::unix::fs::FileExt`, so it builds on Unix only. Windows needs `std::os::windows::fs::FileExt::seek_read`.
@@ -192,23 +195,93 @@ sqlite_dungeon/
       pub fn header(&self) -> &DbHeader;
       pub fn schema(&self) -> &Schema;
       pub fn page(&mut self, n: u64) -> Result<Page, CustomErr>;
-      pub fn query(&mut self, sql: &str) -> Result<String, CustomErr>;
+      pub fn query(&mut self, sql: &str) -> Result<QueryResult, CustomErr>;
   }
-  // cli: let mut db = Db::open(FileSource::open(path)?)?; db.query(sql)?
+  // cli: let mut db = Db::open(FileSource::open(path)?)?; println!("{}", db.query(sql)?)
   ```
   - [x] Add `Db<S> { src, header, schema }` in `db/db.rs`, with `Db::open(src)` reading the header and page 1.
   - [x] Replace `BTree` with `Schema` (built from page 1 by `Schema::new(&page_01)`), and move `Table`/`Index` and their builders to `parser/elements.rs`.
   - [x] Update the `cli` and the tests to `Db`. `cli` uses `db.header.page_size`, `db.table_count()`, `db.tables()` and `db.parse_page(n)`; queries go through `processor::process(&mut db, sql)`.
   - [x] Keep `Db` generic over `S` instead of using `Box<dyn PageSource>`: each binary uses exactly one source (CLI/server → `FileSource`, wasm → `JsFileSource`, tests → `MemSource`).
   - [x] **Borrowing:** `process` copies the root page numbers (`u64`) out of `&Table` before calling the scans with `&mut Db`, so the schema borrow ends first and E0502 doesn't occur. If the scans ever need `&Table` and `&mut` source at the same time, borrow the fields separately: `let Db { src, schema, .. } = db;`.
-  - [ ] Make `schema` a plain `Schema` instead of `Option<Schema>`. `Db::open` always sets it, so the `None` branches in `table_count`, `table` and `tables` are dead code.
-  - [ ] Make the fields private (`src`, `header` and `schema` are `pub` today) and expose `header()` and `schema()` accessors, so a caller can't swap the source under a loaded schema.
+  - [x] Make `schema` a plain `Schema` instead of `Option<Schema>`. `Db::open` always sets it, so the `None` branches in `table_count`, `table` and `tables` are dead code.
+  - [x] Make the fields private (`src`, `header` and `schema` are `pub` today) and expose `header()` and `schema()` accessors, so a caller can't swap the source under a loaded schema.
   - [ ] Move to the target public API: `db.page(n)` (today `parse_page`) and `db.query(sql)` wrapping `processor::process`. Then make `parse_page`, `process` and the scans internal.
   - [ ] Later, together with the page cache: change reads to take `&self` (`File::read_at` only needs `&self`) and put the cache behind a `RefCell`/`Mutex`. That lets Axum handlers share one `Db`. Sharing across threads also needs `Rc` in `Table` to become `Arc`.
+- [ ] **Structured query results.** Today `process` returns `Result<String, _>`: `extract_columns` formats each row as `"v|v"`, and `process` sorts and joins them with `\n`. That works for the Codecrafters tests, but the UI (Phase 5 walk, serde/JSON) and the tests can't use the values without parsing the string again. Return data instead and format it at the edge.
+  - Options considered:
+    | | `Vec<HashMap<String, ValueExpr>>` | `Vec<Row>`, `Row = Vec<ValueExpr>` in select order |
+    |---|---|---|
+    | Column order | Lost (`HashMap` is unordered), so `"v\|v"` output needs a separate order list anyway | Kept: it's the vector order |
+    | Duplicate names (`SELECT name, name`, `*` plus `id`) | Keys collide | Fine |
+    | Cost | Every row allocates its own keys and a hash table | One `Vec` per row, names stored once |
+    | Lookup by name | Direct | Resolve the name to an index once (`columns.iter().position(..)`), then `row[i]` |
+  - [ ] **Decision: `Vec<Row>`** plus the column names stored once. Name lookup isn't needed per row: `stmt.resolve(table)` already maps names to indexes, which is what `extract_columns` does with `columns_index`.
+    ```rust
+    pub struct Row(pub Vec<ValueExpr>);   // values in SELECT order
+
+    pub struct QueryResult {
+        pub columns: Vec<String>,  // "id", "name", "count(*)", …
+        pub rows: Vec<Row>,
+    }
+
+    impl Display for Row {             // Codecrafters / sqlite3 format: "v|v|v"
+        fn fmt(&self, f: &mut Formatter) -> fmt::Result { /* join values with '|' */ }
+    }
+    impl Display for QueryResult {     // rows joined with '\n'
+        …
+    }
+    ```
+  - [ ] Change `extract_columns` to return `Vec<Row>` (`ValueExpr` from each column, `ValueExpr::Integer(row_id)` for `id`) and `process` to return `QueryResult`. This replaces the `QueryOutput { rows: Vec<String> }` stub in `processor.rs`.
+  - [ ] `COUNT(*)` becomes a normal result: `columns = ["count(*)"]`, one row `[Integer(n)]`. The `early_return` flag goes away.
+  - [ ] Implement `Display for ValueExpr` to match sqlite3's output: `Null` prints as an empty string, and integers/text as-is. Check how sqlite3 prints floats (for example `1.0` vs `1`) before relying on it.
+  - [ ] Sorting: today `output.sort()` sorts the formatted strings. Decide whether the core keeps sorting (on `ValueExpr` order, which differs from string order: `10` < `9` as text) or leaves it to the caller. Without `ORDER BY`, SQLite doesn't guarantee an order, so sorting in the CLI or tests only (to keep comparisons stable) is probably the cleaner choice.
+  - [ ] Move the tests from comparing joined strings to comparing `rows`/values, and keep one or two tests on the `Display` output for the Codecrafters format.
+  - [ ] Later (with the serde item): derive `Serialize` on `QueryResult`, `Row` and `ValueExpr` so `/api/db/walk` and the WASM `walk()` return the rows as JSON.
 - [ ] **Errors with `thiserror`** (started: the dependency is added, but `thiserror::Error` is imported and not used yet):
   - [ ] Derive `Error` on `CustomErr` and replace the hand-written `From` impls with `#[from]`.
   - [ ] Have `IOError` carry the `io::Error` (`Io(#[from] io::Error)`). At the moment `map_err(|_| CustomErr::IOError)` discards the cause.
-  - [ ] Remove `anyhow` from `core`'s `Cargo.toml`. `core` doesn't use it, and a library should expose typed errors; `anyhow` belongs in `cli` and `server`.
+  - [x] Remove `anyhow` from `core`'s `Cargo.toml`. A library should expose typed errors; `anyhow` belongs in `cli` and `server`, so add `anyhow = { workspace = true }` to `cli/Cargo.toml`.
+- [ ] **Tracing and a debug feature.** Build with an opt-in Cargo feature to get logs of what the core was doing, and a trace of where an error happened, without slowing down or bloating normal builds:
+  - [ ] Add an opt-in feature to `dungeon_core`, off by default, so normal and WASM builds carry no tracing code:
+    ```toml
+    # crates/core/Cargo.toml
+    [features]
+    trace = ["dep:tracing", "dep:tracing-error"]
+
+    [dependencies]
+    tracing = { workspace = true, optional = true }
+    tracing-error = { workspace = true, optional = true }
+    ```
+    A feature, not `cfg(debug_assertions)`, so a release build can also be traced when a bug only shows up with optimizations.
+  - [ ] Add spans to the main paths, only when the feature is on: `#[cfg_attr(feature = "trace", tracing::instrument(skip(self), err))]` on `Db::open`, `Db::parse_page`, `PageSource::read_page`, `PageCell::new`, `get_overflow_payload`, `Schema::new`, `process` and the scans. `err` logs the error as an event when the function returns `Err`. Record the useful fields: page number, page type, cell offset, overflow page.
+  - [ ] **Where did the error happen?** Capture context when the error is created:
+    - `tracing_error::SpanTrace`: the chain of active spans, for example `parse_page{page_no=1204}` › `PageCell::new{cell_offset=3012}` › `get_overflow_payload{ptr=1888}`. This is the most useful context, because it's about pages and cells rather than Rust functions.
+    - `std::backtrace::Backtrace`: the Rust call stack. It works on stable and is only collected when `RUST_BACKTRACE=1` (or `RUST_LIB_BACKTRACE=1`) is set, so it costs almost nothing when off.
+  - [ ] Change the error type so it can carry that context: a struct wrapping today's enum, done together with the `thiserror` item above.
+    ```rust
+    #[derive(thiserror::Error, Debug)]
+    #[error("{kind}")]
+    pub struct Error {
+        pub kind: ErrorKind,          // today's CustomErr variants
+        backtrace: Backtrace,         // Backtrace::capture()
+        #[cfg(feature = "trace")]
+        span_trace: SpanTrace,        // SpanTrace::capture()
+    }
+    ```
+    With `impl From<ErrorKind> for Error` doing the capture, `Err(ErrorKind::ParsePage(..))?` keeps working everywhere. Note: thiserror's automatic `backtrace` field support needs nightly. On stable, store the `Backtrace` yourself and print it in `Debug`.
+  - [ ] **Subscribers** (in the binaries, never in `core`):
+    - `cli`: a `trace` feature that enables `dungeon_core/trace` and installs `tracing-subscriber` with an `EnvFilter` (`RUST_LOG`) plus the `tracing_error::ErrorLayer`, which `SpanTrace` needs. On error, print the `SpanTrace` and the `Backtrace`. Consider `color-eyre` in the `cli` for nicely formatted reports.
+    - `server`: already uses `tracing` (Phase 2). Add `ErrorLayer`, and log the `SpanTrace` in `ApiError` before turning it into a response. Don't send it to the client.
+    - `wasm`: send events to the browser console with `tracing-web` (or `tracing-wasm`), behind the same feature. Check which one is maintained before choosing.
+  - [ ] Add a `just` recipe for debugging:
+    ```sh
+    just debug samples/companies.db ".page 5"
+    # RUST_BACKTRACE=1 RUST_LOG=dungeon_core=trace \
+    #   cargo run -p cli --features trace -- samples/companies.db ".page 5"
+    ```
+  - [ ] Add a test that a forced error (a corrupt page from `MemSource`) carries a non-empty `SpanTrace` when the feature is on: `cargo test -p dungeon_core --features trace`.
+  - [ ] Note: this is diagnostic **logging**. It's separate from the Phase 5 `Tracer` trait, which records walk events (pages visited, keys compared) as data for the UI. Keep the names distinct (for example `WalkRecorder` for the Phase 5 one) so they aren't confused.
 - [ ] Add a small LRU page cache in front of any `PageSource`.
 - [ ] Add `Span` to every parsed field.
 - [ ] Remove `expect`/`unwrap`/slice panics from parsing paths and make `parse_varint` bounds-checked.
@@ -298,6 +371,8 @@ just serve-db samples/companies.db
                  # cargo run -p server -- --db samples/companies.db  (local mode)
 just cli samples/companies.db ".tables"
                  # cargo run -p cli -- samples/companies.db ".tables"
+just debug samples/companies.db ".page 5"
+                 # RUST_BACKTRACE=1 RUST_LOG=dungeon_core=trace cargo run -p cli --features trace -- …
 ```
 
 ## References

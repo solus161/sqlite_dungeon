@@ -1,6 +1,6 @@
-use crate::exceptions::CustomErr;
-use crate::page_source::PageSource;
 use crate::data_types::ValueExpr;
+use crate::exceptions::CustomErr;
+use crate::io::page_source::PageSource;
 
 use super::page::PageType;
 use super::payload::Payload;
@@ -84,8 +84,14 @@ pub enum PageCell {
 }
 
 impl PageCell {
-    pub fn new<T>(page_type: &PageType, buf: &[u8], src: &mut T, page_size: u64) -> Result<Self, CustomErr>
-    where T: PageSource
+    pub fn new<T>(
+        page_type: &PageType,
+        buf: &[u8],
+        src: &mut T,
+        page_size: u64,
+    ) -> Result<Self, CustomErr>
+    where
+        T: PageSource,
     {
         match page_type {
             PageType::TblInterior => {
@@ -162,9 +168,14 @@ impl PageCell {
 
     /// A payload may be in two or more pages
     /// this walks the payload till overflow_ptr is none
-    fn get_overflow_payload<T>(src: &mut T, page_size: u64, buf: &[u8], payload_length: u64)
-        -> Result<Vec<u8>, CustomErr>
-    where T: PageSource
+    fn get_overflow_payload<T>(
+        src: &mut T,
+        page_size: u64,
+        buf: &[u8],
+        payload_length: u64,
+    ) -> Result<Vec<u8>, CustomErr>
+    where
+        T: PageSource,
     {
         let overflow_ptr = u32::from_be_bytes(*buf.last_chunk::<4>().ok_or(
             CustomErr::Execution("Corrupted page: overflow payload".to_string()),

@@ -1,9 +1,9 @@
+use super::elements::Table;
 use super::tokenizer::{Token, Tokens};
 use super::{Build, Eval, EvalOutput};
-use crate::db::payload::{Payload};
-use crate::exceptions::CustomErr;
 use crate::data_types::ValueExpr;
-use super::elements::Table;
+use crate::db::payload::Payload;
+use crate::exceptions::CustomErr;
 
 // Trait for node that can be evaluated into bool
 // WhereCondition or WhereOperator node
@@ -812,8 +812,8 @@ impl Eval for IndexCondition {
 // Testing
 #[cfg(test)]
 mod tests {
-    use crate::parser::tokenizer::tokenize;
     use super::*;
+    use crate::parser::tokenizer::tokenize;
 
     #[test]
     fn test_build_select() {

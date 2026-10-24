@@ -2,7 +2,7 @@ use std::fmt::Debug;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 
-use crate::page_source::PageSource;
+use super::page_source::PageSource;
 use crate::exceptions::CustomErr;
 
 pub struct FileSource {
@@ -10,12 +10,10 @@ pub struct FileSource {
 }
 
 impl FileSource {
-    pub fn new(file_path: &str) -> Self {
-        let file_obj = File::open(file_path).expect("Invalid file path");
+    pub fn new(file_path: &str) -> Result<Self, CustomErr> {
+        let file_obj = File::open(file_path).map_err(|_| CustomErr::IOError)?;
 
-        Self {
-            src: file_obj,
-        }
+        Ok(Self { src: file_obj })
     }
 }
 
@@ -28,8 +26,13 @@ impl Debug for FileSource {
 }
 
 impl PageSource for FileSource {
+    /// This must mirror `std::io::unix::fx:FileExt::read_exact_at` behavior 
+    /// It never read more bytes than needed to fill buf,
+    /// but error if read pass EoF
     fn read_exact_at(&mut self, buf: &mut [u8], offset: u64) -> Result<(), CustomErr> {
-        self.src.read_exact_at(buf, offset).map_err(|_| CustomErr::IOError)?;
+        self.src
+            .read_exact_at(buf, offset)
+            .map_err(|_| CustomErr::IOError)?;
         Ok(())
     }
 }

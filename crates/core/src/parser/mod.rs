@@ -1,13 +1,13 @@
 pub mod create;
+pub mod elements;
 pub mod select;
 pub mod tokenizer;
-pub mod elements;
 
+use crate::db::payload::Payload;
 use crate::{exceptions::CustomErr, parser::tokenizer::tokenize};
 use create::{CreateIndexStmt, CreateTableStmt};
 use select::SelectStmt;
 use tokenizer::{Token, Tokens};
-use crate::db::payload::Payload;
 
 // A general trait for all AST node
 pub trait Build: Sized {
