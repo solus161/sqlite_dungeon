@@ -68,7 +68,7 @@ Neither mode uploads the file. Uploading a large DB to a remote server is the sl
 **What file size changes.** Opening the file and inspecting single pages cost the same at 10 MB or 10 GB. Size only matters for work that touches every page:
 - **Page map:** classify pages in the background and show progress, cache the results by page number, and draw a downsampled overview for very large page counts.
 - **Full-scan replay:** cap the recorded trace (for example, the first N leaf pages) and tell the user it was cut short.
-- **Page cache:** a small LRU of parsed pages in the core, so going back to a page doesn't read it again.
+- **Page cache:** a small LRU of page bytes in the core (later maybe parsed pages), so going back to a page doesn't read it again.
 
 ## Tech stack
 
@@ -99,7 +99,8 @@ sqlite_dungeon/
 │   │       ├── io/
 │   │       │   ├── page_source.rs         # PageSource trait (read_exact_at + default read_page)
 │   │       │   ├── file_source.rs         # FileSource: positional reads from disk
-│   │       │   └── mem_source.rs          # MemSource(Vec<u8>): tests, small samples
+│   │       │   ├── mem_source.rs          # MemSource(Vec<u8>): tests, small samples
+│   │       │   └── lru_cache.rs           # LRUCache: page bytes by page number (later CachedSource<S>)
 │   │       ├── db/
 │   │       │   ├── db.rs                  # Db<S>, DbHeader, Schema
 │   │       │   ├── page.rs                # Page, PageType, PageBuilder
@@ -206,7 +207,7 @@ sqlite_dungeon/
   - [x] **Borrowing:** `process` copies the root page numbers (`u64`) out of `&Table` before calling the scans with `&mut Db`, so the schema borrow ends first and E0502 doesn't occur. If the scans ever need `&Table` and `&mut` source at the same time, borrow the fields separately: `let Db { src, schema, .. } = db;`.
   - [x] Make `schema` a plain `Schema` instead of `Option<Schema>`. `Db::open` always sets it, so the `None` branches in `table_count`, `table` and `tables` are dead code.
   - [x] Make the fields private (`src`, `header` and `schema` are `pub` today) and expose `header()` and `schema()` accessors, so a caller can't swap the source under a loaded schema.
-  - [ ] Move to the target public API: `db.page(n)` (today `parse_page`) and `db.query(sql)` wrapping `processor::process`. Then make `parse_page`, `process` and the scans internal.
+  - [x] Move to the target public API: `db.page(n)` (today `parse_page`) and `db.query(sql)` wrapping `processor::process`. Then make `parse_page`, `process` and the scans internal.
   - [ ] Later, together with the page cache: change reads to take `&self` (`File::read_at` only needs `&self`) and put the cache behind a `RefCell`/`Mutex`. That lets Axum handlers share one `Db`. Sharing across threads also needs `Rc` in `Table` to become `Arc`.
 - [ ] **Structured query results.** Today `process` returns `Result<String, _>`: `extract_columns` formats each row as `"v|v"`, and `process` sorts and joins them with `\n`. That works for the Codecrafters tests, but the UI (Phase 5 walk, serde/JSON) and the tests can't use the values without parsing the string again. Return data instead and format it at the edge.
   - Options considered:
@@ -282,7 +283,29 @@ sqlite_dungeon/
     ```
   - [ ] Add a test that a forced error (a corrupt page from `MemSource`) carries a non-empty `SpanTrace` when the feature is on: `cargo test -p dungeon_core --features trace`.
   - [ ] Note: this is diagnostic **logging**. It's separate from the Phase 5 `Tracer` trait, which records walk events (pages visited, keys compared) as data for the UI. Keep the names distinct (for example `WalkRecorder` for the Phase 5 one) so they aren't confused.
-- [ ] Add a small LRU page cache in front of any `PageSource`.
+- [ ] **LRU page cache** (in progress, `io/lru_cache.rs`). Caches raw page bytes by page number, so revisiting a page skips the read but still re-parses it.
+  - [x] Rewrite without `Rc<RefCell>`: `LinkedList { nodes: HashMap<u64, Node { id, prev, next }>, head, tail }` links nodes by page number, so there are no reference cycles and no borrow juggling. `LRUCache { cache: HashMap<u64, Vec<u8>>, linked_list }`. `get` takes `&mut self` and moves the key to the head. `LinkedListIter` walks the list from the tail (least recent) to the head.
+  - [ ] Fix the bugs found by running edge cases on a copy (the current test passes because `add`'s `Result` is ignored and `assert_orders` zips, so an empty list passes):
+    | Case | Result |
+    |---|---|
+    | Capacity 3, set 1,2,3 then set 4 | List is empty, `tail = None`; 4 entries kept |
+    | Set 1,2,3 then `get(&3)` (already head) | Order `[1, 2]`: 3 is unlinked |
+    | Set 1 then `get(&1)` (single node) | `tail = None`, list is empty |
+    | Set 1 then `get(&99)` (missing key) | 99 is added to the list, so it can evict a real page |
+    - `drop_tail` calls `set_next(id, None)` *before* reading `node.next`, so the new tail is always `None`.
+    - Eviction never removes the old tail from `nodes` or its bytes from `cache`, so memory is never bounded.
+    - `add` on the first node calls `set_next(head, Some(k))` with `head == k`, which returns `SelfRef`. Only the ignored `Result` hides it.
+    - `move_to_head` doesn't return early when the key is already the head, so `set_next(head, id)` is a self-reference (`SelfRef`) after `prev.next` was already cleared. When the node is the only one, it also sets `tail = None`.
+    - `get` should check `cache` first and only touch the list on a hit.
+    - `get`/`set` drop the `Result` from `add` (`unused_must_use` warning). Once the list logic is correct the `SelfRef` checks shouldn't be needed, and `add` can return `()`.
+  - [ ] Simplify: store the value inside the node (`HashMap<u64, Node { value, prev, next }>`) so there's one map instead of two that must stay in sync. `count` duplicates `nodes.len()`, and `Node.id` duplicates the map key.
+  - [ ] Tests: `assert_orders` should compare `iter.collect::<Vec<_>>()` with the expected `Vec` (catches the empty list), and also check `head`. Add cases for: get head, get on a single node, get on a missing key, eviction removes the key, set an existing key updates its value, capacity 1 and 0.
+  - [ ] **Wiring into `PageSource`:** today the trait has two required methods, `from_cache(&self, n) -> Option<&[u8]>` and `to_cache(&mut self, buf)`, stubbed out in `FileSource`, `MemSource` and the test `VecSource`. `read_page` checks `from_cache` but never calls `to_cache`, and `FileSource` holds an `LRUCache::new(1000)` it never uses. Issues:
+    - `from_cache(&self)` can't update the LRU order, which needs `&mut`.
+    - Every source has to implement caching, even `MemSource`, where it's pointless.
+    - Recommended instead: a wrapper `CachedSource<S: PageSource> { inner: S, cache: LRUCache }` that implements `PageSource`, passes `read_exact_at` to `inner` and overrides `read_page` to check the cache and fill it on a miss. Remove `from_cache`/`to_cache` from the trait. Usage: `Db::open(CachedSource::new(FileSource::new(path)?, 256))`.
+    - Return `Rc<[u8]>` (or `Arc<[u8]>` for Axum) from the cache instead of copying the page into a new `Vec` on every hit, or accept the copy, since 4 KB is cheap next to parsing.
+  - [ ] Later: decide whether to also cache parsed `Page`s (saves parsing, which costs more than the read once the OS file cache is warm).
 - [ ] Add `Span` to every parsed field.
 - [ ] Remove `expect`/`unwrap`/slice panics from parsing paths and make `parse_varint` bounds-checked.
 - [ ] Fix known bugs (all still present after the restructure):

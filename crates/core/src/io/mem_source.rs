@@ -1,11 +1,11 @@
-use std::{fmt::Debug};
 use crate::exceptions::CustomErr;
+use std::fmt::Debug;
 
 use super::page_source::PageSource;
 
 /// A wrapper to read file when served through browser
 pub struct MemSource {
-    src: Vec<u8>
+    src: Vec<u8>,
 }
 
 impl MemSource {
@@ -17,9 +17,7 @@ impl MemSource {
 
 impl Debug for MemSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MemSource")
-            .field("src", &self.src)
-            .finish()
+        f.debug_struct("MemSource").field("src", &self.src).finish()
     }
 }
 
@@ -31,10 +29,16 @@ impl PageSource for MemSource {
         if dst_len <= copied_len {
             buf.copy_from_slice(&self.src[..dst_len]);
             Ok(())
-        } else  {
-            Err(CustomErr::IOError) 
+        } else {
+            Err(CustomErr::IOError)
         }
     }
+
+    fn from_cache(&self, page_number: u64) -> Option<&[u8]> {
+        None
+    }
+
+    fn to_cache(&mut self, buf: &[u8]) {}
 }
 
 #[cfg(test)]
@@ -55,7 +59,8 @@ mod tests {
         // Dest len <= src len
         let mut buf2 = [0u8; 4];
         let offset: usize = 2;
-        mem.read_exact_at(buf2.as_mut_slice(), offset as u64).unwrap();
+        mem.read_exact_at(buf2.as_mut_slice(), offset as u64)
+            .unwrap();
         buf2.iter().for_each(|x| assert_eq!(*x, 1u8));
     }
 }

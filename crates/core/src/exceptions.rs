@@ -18,6 +18,7 @@ pub enum CustomErr {
     Execution(String),
     IOError,
     InvalidMetadata,
+    SelfRef,
 }
 
 impl From<ParseIntError> for CustomErr {

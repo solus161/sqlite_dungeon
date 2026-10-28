@@ -13,11 +13,21 @@ pub trait PageSource {
         if page_number == 0 {
             return Err(CustomErr::ReadPage("Page number starts from 1".to_string()));
         }
-        let offset = (page_number - 1) * page_size;
-        let mut buf = vec![0u8; page_size as usize];
-        self.read_exact_at(&mut buf, offset)?;
-        Ok(buf)
+        if let Some(page) = self.from_cache(page_number) {
+            Ok(page.into())
+        } else {
+            let offset = (page_number - 1) * page_size;
+            let mut buf = vec![0u8; page_size as usize];
+            self.read_exact_at(&mut buf, offset)?;
+            Ok(buf)
+        }
     }
+
+    /// Return a byte page from cache if any
+    fn from_cache(&self, page_number: u64) -> Option<&[u8]>;
+
+    /// Save a byte page to cache
+    fn to_cache(&mut self, buf: &[u8]);
 }
 
 #[cfg(test)]
@@ -37,6 +47,12 @@ mod tests {
             buf.copy_from_slice(src);
             Ok(())
         }
+
+        fn from_cache(&self, _page_number: u64) -> Option<&[u8]> {
+            None
+        }
+
+        fn to_cache(&mut self, _buf: &[u8]) {}
     }
 
     #[test]

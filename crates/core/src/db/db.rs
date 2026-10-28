@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 
+use super::utils::get_offset;
 use crate::db::page::Page;
 use crate::db::page::{PageBuilder, PageType};
 use crate::db::page_cell::PageCell;
 use crate::parser::elements::{IndexBuilder, Table, TableBuilder};
 use crate::parser::{Ast, ast_from_str};
+use crate::processor::process;
 use crate::{exceptions::CustomErr, io::page_source::PageSource};
-use super::utils::get_offset;
 
 pub struct DbHeader {
     pub page_count: u64,
@@ -165,7 +166,11 @@ impl<S: PageSource> Db<S> {
         let buf = src.read_page(1, header.page_size)?;
         let page_01 = Self::parse_page(&mut src, &buf, 1, header.page_size)?;
         let schema = Schema::new(&page_01)?;
-        Ok(Self { src, header, schema })
+        Ok(Self {
+            src,
+            header,
+            schema,
+        })
     }
 
     pub fn page_size(&self) -> u64 {
@@ -187,8 +192,14 @@ impl<S: PageSource> Db<S> {
     }
 
     /// Core of `page`, independent of `Db` initialization
-    pub fn parse_page(src: &mut S, buf: &[u8], page_no: u64, page_size: u64) -> Result<Page, CustomErr> 
-    where S: PageSource
+    pub fn parse_page(
+        src: &mut S,
+        buf: &[u8],
+        page_no: u64,
+        page_size: u64,
+    ) -> Result<Page, CustomErr>
+    where
+        S: PageSource,
     {
         let mut builder = PageBuilder::new(page_no);
 
@@ -231,12 +242,7 @@ impl<S: PageSource> Db<S> {
         // physical position of cell does not matter
         for _ in 0..cell_count {
             let cell_offset = u16::from_be_bytes(get_offset(buf, offset, 2).try_into()?) as u64;
-            let cell = PageCell::new(
-                &page_type,
-                &buf[cell_offset as usize..],
-                src,
-                page_size,
-            )?;
+            let cell = PageCell::new(&page_type, &buf[cell_offset as usize..], src, page_size)?;
             offset += 2;
             builder.with_cell(cell_offset, cell);
         }
@@ -259,7 +265,10 @@ impl<S: PageSource> Db<S> {
     {
         let buf = self.src.read_page(page_no, self.header.page_size)?;
         Self::parse_page(&mut self.src, &buf, page_no, self.header.page_size)
-        
+    }
+
+    pub fn query(&mut self, query: &str) -> Result<String, CustomErr> {
+        process(self, query)
     }
 }
 

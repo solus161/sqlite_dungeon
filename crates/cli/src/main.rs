@@ -1,6 +1,6 @@
 // #![allow(dead_code, unused_imports, unused_variables)]
 use dungeon_core::exceptions::CustomErr;
-use dungeon_core::{db::db::Db, io::file_source::FileSource, processor::process};
+use dungeon_core::{db::db::Db, io::file_source::FileSource};
 
 fn main() -> Result<(), CustomErr> {
     // Parse arguments
@@ -42,7 +42,7 @@ fn main() -> Result<(), CustomErr> {
             println!("{}", page);
         }
         _ => {
-            let output = process(&mut db, command.as_str());
+            let output = db.query(command.as_str());
             match output {
                 Ok(v) => println!("{}", v),
                 Err(e) => println!("ERR {:?}", e),
