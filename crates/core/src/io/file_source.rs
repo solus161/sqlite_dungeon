@@ -42,9 +42,19 @@ impl PageSource for FileSource {
         Ok(())
     }
 
-    fn from_cache(&self, page_number: u64) -> Option<&[u8]> {
-        None
+    fn read_page(&mut self, page_number: u64, page_size: u64) -> Result<Vec<u8>, CustomErr> {
+        // Page 0 does not exist, also guards page_number - 1 from underflow
+        if page_number == 0 {
+            return Err(CustomErr::ReadPage("Page number starts from 1".to_string()));
+        }
+        
+        if let Some(page) = self.cache.get(&page_number) {
+            Ok(page.into())
+        } else {
+            let offset = (page_number - 1) * page_size;
+            let mut buf = vec![0u8; page_size as usize];
+            self.read_exact_at(&mut buf, offset)?;
+            Ok(buf)
+        }
     }
-
-    fn to_cache(&mut self, buf: &[u8]) {}
 }

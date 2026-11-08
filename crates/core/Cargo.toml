@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 paste = { workspace = true }
 thiserror = { workspace = true }
+
+[features]
+perf_measure = []
