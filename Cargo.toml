@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/cli","crates/core", "crates/server", "crates/wasm"]
+members = ["crates/bench","crates/cli","crates/core", "crates/server", "crates/wasm"]
+devault-members = ["crates/cli","crates/core", "crates/server", "crates/wasm"]
 
 [workspace.dependencies]
 paste = "1.0.15"

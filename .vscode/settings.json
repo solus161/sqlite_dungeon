@@ -1,0 +1,3 @@
+{
+    "rust-analyzer.cargo.features": ["dungeon_core/perf_measure"]
+}
